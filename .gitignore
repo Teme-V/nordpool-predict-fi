@@ -30,3 +30,5 @@ model/models.db
 .envrc
 .mailmap
 .pre-commit-config.yaml
+predict-update.sh
+.gitignore
