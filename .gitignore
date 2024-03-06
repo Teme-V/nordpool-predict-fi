@@ -32,3 +32,4 @@ model/models.db
 .pre-commit-config.yaml
 predict-update.sh
 .gitignore
+data/prediction.db
