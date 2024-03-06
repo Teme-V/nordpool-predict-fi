@@ -31,5 +31,4 @@ model/models.db
 .mailmap
 .pre-commit-config.yaml
 predict-update.sh
-.gitignore
 data/prediction.db
