@@ -16,8 +16,10 @@ from util.sahkotin import update_spot
 from util.fingrid import update_nuclear
 from util.llm import narrate_prediction
 from datetime import datetime, timedelta
+from util.entso_e import entso_e_nuclear
 from util.sql import db_update, db_query_all
 from util.github import push_updates_to_github
+from util.dataframes import update_df_from_df
 from util.fmi import update_wind_speed, update_temperature
 from util.models import write_model_stats, stats, list_models
 from util.eval import create_prediction_snapshot, rotate_snapshots
@@ -43,8 +45,8 @@ try:
     repo_path = get_mandatory_env_variable('REPO_PATH')
     predictions_file = get_mandatory_env_variable('PREDICTIONS_FILE')
     averages_file = get_mandatory_env_variable('AVERAGES_FILE')
-    past_performance_file = get_mandatory_env_variable('PAST_PERFORMANCE_FILE')
     fingrid_api_key = get_mandatory_env_variable('FINGRID_API_KEY')
+    entso_e_api_key = get_mandatory_env_variable('ENTSO_E_API_KEY')
     fmisid_ws_env = get_mandatory_env_variable('FMISID_WS')
     fmisid_t_env = get_mandatory_env_variable('FMISID_T')
     fmisid_ws = ['ws_' + id for id in fmisid_ws_env.split(',')]
@@ -55,11 +57,11 @@ except ValueError as e:
     exit(1)
 
 # Optional env variables for --github or --narrate:
+openai_api_key = os.getenv('OPENAI_API_KEY') # OpenAI API key, used by --narrate
+narration_file = os.getenv('NARRATION_FILE') # used by --narrate
 token = os.getenv('TOKEN') # used by --github
 commit_message = os.getenv('COMMIT_MESSAGE') # used by --github
 deploy_folder_path = os.getenv('DEPLOY_FOLDER_PATH') # used by --github
-openai_api_key = os.getenv('OPENAI_API_KEY') # OpenAI API key, used by --narrate
-narration_file = os.getenv('NARRATION_FILE') # used by --narrate
 
 # Arguments
 parser = argparse.ArgumentParser()
@@ -67,12 +69,11 @@ parser.add_argument('--train', action='store_true', help='Train a new model cand
 parser.add_argument('--eval', action='store_true', help='Show evaluation metrics for the current database')
 parser.add_argument('--training-stats', action='store_true', help='Show training stats for candidate models in the database as a CSV')
 parser.add_argument('--dump', action='store_true', help='Dump the SQLite database to CSV format')
-parser.add_argument('--past-performance', action='store_true', help='Generate past performance stats for recent months')
 parser.add_argument('--plot', action='store_true', help='Plot all predictions and actual prices to a PNG file in the data folder')
 parser.add_argument('--predict', action='store_true', help='Generate price predictions from now onwards')
 parser.add_argument('--add-history', action='store_true', help='Add all missing predictions to the database post-hoc; use with --predict')
 parser.add_argument('--narrate', action='store_true', help='Narrate the predictions into text using an LLM')
-parser.add_argument('--commit', action='store_true', help='Commit the results to DB and deploy folder; use with --predict, --narrate, --past-performance')
+parser.add_argument('--commit', action='store_true', help='Commit the results to DB and deploy folder; use with --predict, --narrate')
 parser.add_argument('--deploy', action='store_true', help='Deploy the output files to the deploy folder but not GitHub')
 # --publish will be deprecated in the future, prefer --deploy instead:
 parser.add_argument('--publish', action='store_true', help='Deploy the output files to the deploy folder but not GitHub', dest='deploy') #redirected
@@ -123,7 +124,8 @@ if args.train:
     
     print(f"→ Model trained:\n  MAE (vs test set): {mae}\n  MSE (vs test set): {mse}\n  R² (vs test set): {r2}\n  MAE (vs 10x500 randoms): {samples_mae}\n  MSE (vs 10x500 randoms): {samples_mse}\n  R² (vs 10x500 randoms): {samples_r2}")
 
-    if args.commit:
+    # If we're moving towards --predict, we're not saving, it's continuous training then
+    if args.commit and not args.predict:
         joblib.dump(rf_trained, model_path)
         print(f"→ Model saved to {model_path}")
 
@@ -132,7 +134,7 @@ if args.train:
         print("→ Model stats added to the database.")
         print("→ Training done.")
     else:
-        print("→ Model NOT saved to the database (no --commit).")
+        print("→ Model NOT saved to the database but remains available in memory for --prediction.")
         print("→ Training done.")
 
 # Show evals based on the current database
@@ -236,19 +238,25 @@ if args.predict:
     df.rename(columns={'index': 'Timestamp'}, inplace=True)
 
     # Get the latest FMI wind speed values for the data frame, past and future
-    # NOTE: To save on API calls, we don't fill in weather history beyond 7 days even if asked
+    # NOTE: To save on API calls, this won't backfill history beyond 7 days even if asked
     df = update_wind_speed(df)
            
     # Get the latest FMI temperature values for the data frame, past and future
-    # NOTE: To save on API calls, we don't fill in weather history beyond 7 days even if asked
+    # NOTE: To save on API calls, this won't backfill history beyond 7 days even if asked
     df = update_temperature(df)
        
-    # Get the latest nuclear power data for the data frame, and infer the future
-    # NOTE: To save on API calls, we don't fill in weather history beyond 7 days even if asked
+    # Get the latest nuclear power data for the data frame, and infer the future from last known value
+    # NOTE: To save on API calls, this won't backfill history beyond 7 days even if asked
     df = update_nuclear(df, fingrid_api_key=fingrid_api_key)
-        
+    
+    # Fetch future nuclear downtime information from ENTSO-E unavailability data, h/t github:@pkautio
+    df_entso_e = entso_e_nuclear(entso_e_api_key)
+    
+    # Refresh the previously inferred nuclear power numbers with the ENTSO-E data
+    df = update_df_from_df(df, df_entso_e)
+    
     # Get the latest spot prices for the data frame, past and future if any
-    # NOTE: To save on API calls, we don't fill in weather history beyond 7 days even if asked
+    # NOTE: To save on API calls, this won't backfill history beyond 7 days even if asked
     df = update_spot(df)
     
     # TODO: Decide if including wind power capacity is necessary; it seems to worsen the MSE and R2
@@ -267,7 +275,7 @@ if args.predict:
     df['hour'] = df['Timestamp'].dt.hour
     df['month'] = df['Timestamp'].dt.month
          
-    # Use (if from --train) or load and apply a Random Forest model for predictions
+    # Use (if coming from --train) or load and apply a Random Forest model for predictions
     if rf_trained is None:
         rf_model = joblib.load(rf_model_path)
         print("→ Loaded the Random Forest model from", rf_model_path)
@@ -343,70 +351,8 @@ if args.narrate:
     else:
         print(narration)
 
-# Past performance can be used with the previous arguments
-if args.past_performance:
-    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-
-    past_df = db_query_all(db_path)
-    past_df = past_df.sort_values(by='timestamp')
-
-    past_df['timestamp'] = pd.to_datetime(past_df['timestamp'])
-    before_filtering_length = len(past_df)
-
-    # Filter out rows where 'timestamp' is earlier than 90 days ago or later than now
-    now = datetime.now(pytz.utc)
-    past_df = past_df[(past_df['timestamp'] >= now - timedelta(days=90)) & (past_df['timestamp'] <= now)]
-
-    nan_rows = past_df[past_df['Price_cpkWh'].isna() | past_df['PricePredict_cpkWh'].isna()]
-
-    # Drop empty or NaN rows
-    past_df = past_df.dropna(subset=['Price_cpkWh', 'PricePredict_cpkWh'])
-
-    # Calculate the metrics
-    past_df = past_df.dropna(subset=['Price_cpkWh', 'PricePredict_cpkWh'])
-    y_true = past_df['Price_cpkWh']
-    y_pred = past_df['PricePredict_cpkWh']
-    mae = mean_absolute_error(y_true, y_pred)
-    mse = mean_squared_error(y_true, y_pred)
-    rmse = np.sqrt(mse)
-    r2 = r2_score(y_true, y_pred)
-
-    print("Mean Absolute Error:", mae, "c/kWh")
-    print("Mean Squared Error:", mse, "c/kWh")
-    print("Root Mean Squared Error:", rmse, "c/kWh")
-    print("R-squared:", r2)
-
-    if args.commit:
-        # Prepare data for Apex Charts
-        past_performance_data = {
-            "data": [
-                {"name": "Actual Price", "data": []},
-                {"name": "Predicted Price", "data": []}
-            ],
-            "metrics": {
-                "mae": mae,
-                "mse": mse,
-                "rmse": rmse,
-                "r2": r2
-            }
-        }
-
-        # Convert timestamps to milliseconds since epoch and pair with values
-        for _, row in past_df.iterrows():
-            timestamp_ms = int(row['timestamp'].timestamp() * 1000)
-            past_performance_data["data"][0]["data"].append([timestamp_ms, row['Price_cpkWh']])
-            past_performance_data["data"][1]["data"].append([timestamp_ms, row['PricePredict_cpkWh']])
-        
-        # Save to JSON file
-        past_performance_json_path = os.path.join(deploy_folder_path, past_performance_file)
-        with open(past_performance_json_path, 'w') as f:
-            json.dump(past_performance_data, f)
-
-        print(f"Past performance data saved to {past_performance_json_path}")
-
 # Deploy can be done solo, or with --predict and --narrate
-# This argument was previously called --publish but for now they both point here
-# Note that we have a dedicated --github argument to push to GitHub (not many need to use this step)
+# Note that we have a dedicated --github argument to push to GitHub (not many need to use it)
 if args.deploy:
     print("Deploing the latest prediction data:", deploy_folder_path, "...")
     
@@ -471,7 +417,7 @@ if args.deploy:
 
     # Commit and push the updates to GitHub
     if args.github:
-        files_to_push = [predictions_file, averages_file, narration_file, past_performance_file]
+        files_to_push = [predictions_file, averages_file, narration_file]
 
         try:
             if push_updates_to_github(repo_path, deploy_folder_path, files_to_push, commit_message):
@@ -484,7 +430,7 @@ if args.deploy:
     exit()
 
 if __name__ == "__main__":
-    # If no arguments were given, print a message
+    # If no arguments were given, print usage
     if not any(vars(args).values()):
         print("No arguments given.")
         parser.print_help()

@@ -16,8 +16,12 @@ statsmodels==0.14.1
 <<<<<<< HEAD
 tensorflow==2.15.0
 typer==0.9.0
+<<<<<<< HEAD
 =======
 #tensorflow==2.15.0
 tensorflow
 typer==0.9.0
 >>>>>>> 58f8f07 (update)
+=======
+entsoe-py == 0.6.7
+>>>>>>> upstream/main
